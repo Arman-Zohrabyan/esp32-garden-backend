@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP32 Dashboard</title>
+  <link rel="stylesheet" href="/shared.css?v=202610282207" />
+</head>
+<body>
+
+<header>
+  <span class="logo">ESP32</span>
+  <div class="breadcrumb">
+    <span class="sep">/</span>
+    <span class="active" id="breadcrumb-devices">Devices</span>
+  </div>
+  <div id="lang-switch"></div>
+</header>
+
+<main>
+  <div class="page-title" id="page-title">Devices</div>
+  <div class="page-sub" id="devices-sub">Loading...</div>
+  <div id="devices-container"></div>
+</main>
+
+<script src="/i18n.js?v=202610282207"></script>
+<script src="/shared.js?v=202610282207"></script>
+<script>
+  function applyStaticText() {
+    document.getElementById('breadcrumb-devices').textContent = t('nav.devices');
+    document.getElementById('page-title').textContent = t('index.title');
+  }
+
+  // `silent` (the periodic auto-refresh) re-renders in place: no spinner,
+  // and a failed fetch keeps the last good content instead of replacing it
+  // with an error.
+  async function loadDevices(silent = false) {
+    applyStaticText();
+    const container = document.getElementById('devices-container');
+    const sub = document.getElementById('devices-sub');
+    if (!silent) container.innerHTML = '<div class="spinner"></div>';
+
+    try {
+      const res = await fetch(`${API}/devices`);
+      const devices = await res.json();
+      sub.textContent = t('index.deviceCount', { count: devices.length });
+
+      if (!devices.length) {
+        container.innerHTML = `<div class="empty"><div class="icon">📡</div><div class="msg">${t('index.empty')}</div></div>`;
+        return;
+      }
+
+      // Per-device readouts (battery %, soil %) — always the latest logged
+      // value, however old; the age is surfaced in the label ("ESP32
+      // battery (5m ago)") instead of hiding stale values behind "—".
+      // Fetched in parallel across all devices, and per-device.
+      const readouts = await Promise.all(devices.map(fetchDeviceReadouts));
+
+      container.innerHTML = `<div class="devices-grid">${devices.map((d, i) => deviceCard(d, readouts[i])).join('')}</div>`;
+      renderMiniCharts(devices, readouts);
+    } catch (e) {
+      if (silent) return;
+      container.innerHTML = `<div class="error-msg">${t('index.failedToLoad', { error: e.message })}</div>`;
+      sub.textContent = '';
+    }
+  }
+
+  // Enough history to find where the current cycle began — the card shows
+  // how long the battery has been running on this charge and how long since
+  // the last watering, which both need the cycle's first reading, not just
+  // the latest one.
+  const CARD_HISTORY_LIMIT = 1000;
+
+  async function fetchDeviceReadouts(d) {
+    const [batteries, soilReadings, soilSettings, waterings] = await Promise.all([
+      d.chipId
+        ? fetch(`${API}/battery?deviceChipId=${encodeURIComponent(d.chipId)}`).then(r => r.json()).catch(() => [])
+        : Promise.resolve([]),
+      fetch(`${API}/devices/${d.id}/soil-readings?limit=${CARD_HISTORY_LIMIT}`)
+        .then(r => r.json())
+        .then(p => p.items || [])
+        .catch(() => []),
+      fetch(`${API}/devices/${d.id}/soil-settings`).then(r => r.json()).catch(() => null),
+      // Actual pump runs. "Last watered" has to come from here, not from a
+      // rise in moisture: the soil can also get wetter from rain or from the
+      // probe being moved, neither of which is a watering.
+      fetch(`${API}/devices/${d.id}/waterings?limit=1`)
+        .then(r => r.json())
+        .then(p => p.items || [])
+        .catch(() => []),
+    ]);
+
+    const batteryLogs = await Promise.all(
+      batteries.map(b =>
+        fetch(`${API}/battery-logs?batteryId=${b.id}&limit=${CARD_HISTORY_LIMIT}`)
+          .then(r => r.json())
+          .then(p => p.items || [])
+          .catch(() => [])
+      )
+    );
+
+    // Soil/battery config feed the estimated awake window the status badge
+    // grades "online" against (see awakeWindowMs in shared.js).
+    const awakeMs = awakeWindowMs(soilSettings, batteries);
+
+    // Latest value per series, with its timestamp, plus how long the current
+    // cycle has been running. No staleness gating here — the card shows the
+    // reading's age next to the label instead. null = no records at all.
+    const battery = {};
+    batteries.forEach((b, i) => {
+      const logs = batteryLogs[i] || [];
+      const latest = logs[0];
+      battery[b.type] = latest
+        ? {
+            pct: latest.percentage,
+            at: latest.createdAt,
+            cycle: currentCycle(splitBatteryCycles(logs, d)),
+            pctOf: (l) => l.percentage,
+            atOf: (l) => l.createdAt,
+          }
+        : null;
+    });
+
+    const latestSoil = soilReadings[0];
+    const soil = latestSoil && latestSoil.percent != null
+      ? {
+          pct: latestSoil.percent,
+          at: latestSoil.recordedAt,
+          cycle: currentCycle(splitSoilCycles(soilReadings, d)),
+          pctOf: (r) => r.percent,
+          atOf: (r) => r.recordedAt,
+        }
+      : null;
+
+    return { battery, soil, awakeMs, lastWatering: waterings[0] || null };
+  }
+
+  // The cycle in progress — the newest one. Everything the card shows about
+  // elapsed time and the sparkline comes from this one cycle only.
+  function currentCycle(cycles) {
+    return cycles[cycles.length - 1] || null;
+  }
+
+  function deviceCard(d, readouts) {
+    const name = d.name || `<span style="color:var(--muted);font-style:italic">${t('index.unnamed')}</span>`;
+    const id = encodeURIComponent(d.id);
+    // How long each battery has been running on its current charge, measured
+    // from the first reading of the current cycle (so it needs at least two).
+    // The current percentages aren't listed separately — each sparkline below
+    // labels its own latest value.
+    const elapsed = (labelKey, r) => {
+      if (!r || !r.cycle || r.cycle.length < 2) return '';
+      const startMs = new Date(r.atOf(r.cycle[0])).getTime();
+      return `<span class="readout"><span class="readout-label">${t(labelKey)}</span><span class="readout-value">${formatDuration(Date.now() - startMs)}</span></span>`;
+    };
+    // Time since the pump last ran — from the watering log, not from the
+    // moisture curve (rain and a nudged probe also raise moisture).
+    const sinceWatering = readouts.lastWatering
+      ? `<span class="readout"><span class="readout-label">${t('index.notWatered')}</span><span class="readout-value">${formatDuration(Date.now() - new Date(readouts.lastWatering.wateredAt).getTime())}</span></span>`
+      : '';
+    return `
+      <div class="device-card" onclick="location.href='/device?id=${id}'">
+        <a class="logs-link" href="/logs?id=${id}" onclick="event.stopPropagation()" title="${t('index.viewLogs')}">☰</a>
+        <div class="chip-id">${d.chipId}</div>
+        <div class="device-name">${name}</div>
+        <div class="meta-row">
+          ${statusBadge(d, readouts.awakeMs)}
+          <span class="badge ${d.isActive ? 'active' : 'inactive'}">${d.isActive ? t('index.active') : t('index.inactive')}</span>
+          ${d.firmwareVersion ? `<span class="badge fw">fw ${d.firmwareVersion}</span>` : ''}
+        </div>
+        <div class="readout-row">
+          ${elapsed('index.esp32Running', readouts.battery.esp32)}
+          ${elapsed('index.pumpRunning', readouts.battery.pump)}
+          ${sinceWatering}
+        </div>
+        ${miniCharts(d, readouts)}
+        ${lastWateredLine(readouts.lastWatering)}
+        <div class="last-seen">${t('index.lastSeen', { time: exactAge(d.lastSeenAt) })}</div>
+        <div class="arrow">›</div>
+      </div>`;
+  }
+
+  // "Last watered 2d 5h ago" — from the pump's own record of the run, in the
+  // same line style as "Last seen" right below it. Until the pump has ever
+  // run there is nothing to report, so the line says so rather than guessing
+  // from the moisture curve.
+  function lastWateredLine(lastWatering) {
+    const time = lastWatering
+      ? t('index.lastWatered', { time: exactAge(lastWatering.wateredAt, 'h') })
+      : t('index.neverWatered');
+    return `<div class="last-seen">${time}</div>`;
+  }
+
+  // Sparklines of the current cycles — the same data the device page charts
+  // in full, shrunk to fit a list card. The two batteries share a row, with
+  // soil on its own full-width row below, since a watering cycle spans far
+  // more readings and reads better wide. Rendered after the cards are in the
+  // DOM (renderMiniCharts below), since renderPercentChart measures its
+  // container.
+  const hasCycle = (r) => !!(r && r.cycle && r.cycle.length >= 2);
+
+  function miniChart(labelKey, id) {
+    return `
+      <div class="mini-chart">
+        <div class="mini-chart-label">${t(labelKey)}</div>
+        <div id="${id}"></div>
+      </div>`;
+  }
+
+  function miniCharts(d, readouts) {
+    const esp32 = hasCycle(readouts.battery.esp32);
+    const pump = hasCycle(readouts.battery.pump);
+    const soil = hasCycle(readouts.soil);
+    if (!esp32 && !pump && !soil) return '';
+
+    const batteryRow = esp32 || pump
+      ? `<div class="mini-chart-row">
+          ${esp32 ? miniChart('index.esp32Battery', `mini-batt-${d.id}`) : '<div></div>'}
+          ${pump ? miniChart('index.pumpBattery', `mini-pump-${d.id}`) : '<div></div>'}
+        </div>`
+      : '';
+    const soilRow = soil
+      ? `<div class="mini-chart-row full">${miniChart('index.soil', `mini-soil-${d.id}`)}</div>`
+      : '';
+    return batteryRow + soilRow;
+  }
+
+  function renderMiniCharts(devices, readouts) {
+    devices.forEach((d, i) => {
+      const r = readouts[i];
+      // `width` is the chart's real width in the card: the batteries share a
+      // row (~115px each), soil spans the full content width (~240px). The
+      // viewBox matches it so labels render at their intended px size rather
+      // than being squeezed; height follows to keep the sparklines the same
+      // height in both rows.
+      const charts = [
+        [r.battery.esp32, `mini-batt-${d.id}`, 115],
+        [r.battery.pump, `mini-pump-${d.id}`, 115],
+        [r.soil, `mini-soil-${d.id}`, 240],
+      ];
+      for (const [series, id, width] of charts) {
+        if (!hasCycle(series)) continue;
+        if (!document.getElementById(id)) continue;
+        renderPercentChart(id, series.cycle.map(x => ({ ...x, pct: series.pctOf(x) })), {
+          width,
+          height: 70,
+          // Tighter than the default 36: the sparkline's axis labels are
+          // styled smaller (see .mini-chart in shared.css), so they need
+          // less room and the plot gets the difference. padL still has to
+          // clear the widest label ("100%" never appears here, but "25%" is
+          // ~13 units at this size) plus labelGap, or the text is cut off at
+          // the viewBox edge. Only the 25% and 75% gridlines are labelled:
+          // five labels don't fit at this size, and these two give enough of
+          // a reference to read the curve's height.
+          padL: 22,
+          // No x-axis under a sparkline, so the default 28 units of space
+          // below the plot (40% of this chart's height) would just be a gap
+          // between the chart and whatever follows it.
+          padT: 10,
+          padB: 8,
+          labelGap: 4,
+          labelAt: [25, 75],
+          valueLabel: (p) => `${p.pct}%`,
+          tooltip: (p) => [[t('chart.tooltip.time'), fmtDate(series.atOf(p))]],
+        });
+      }
+    });
+  }
+
+  window.onLangChange = loadDevices;
+  renderLangSwitcher();
+  loadDevices();
+  // Status and readout freshness decay with wall-clock time even when no
+  // new data arrives (a device that stops checking in must eventually turn
+  // offline on screen), so re-render periodically.
+  setInterval(() => loadDevices(true), 30000);
+</script>
+</body>
+</html>
