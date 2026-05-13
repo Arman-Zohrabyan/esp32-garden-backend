@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Device — ESP32 Dashboard</title>
+  <link rel="stylesheet" href="/shared.css?v=202610282207" />
+</head>
+<body>
+
+<header>
+  <a class="logo" href="/">ESP32</a>
+  <div class="breadcrumb">
+    <span class="sep">/</span>
+    <a href="/" id="breadcrumb-devices">Devices</a>
+    <span class="sep">/</span>
+    <span class="active" id="breadcrumb-page">Device</span>
+  </div>
+  <div id="lang-switch"></div>
+  <a class="back-btn" href="/" id="back-btn-label">← Back</a>
+</header>
+
+<main>
+  <div class="page-title" id="detail-title">Device</div>
+  <div class="page-sub" id="detail-sub"></div>
+  <div class="header-actions">
+    <a class="btn-secondary" id="logs-link" href="/logs">View Logs</a>
+    <button class="refresh-btn" style="margin:0" onclick="loadDetail()" id="refresh-btn">Refresh</button>
+  </div>
+  <div class="detail-grid" id="detail-grid"></div>
+</main>
+
+<!-- Cycle-history modal mounts here (see openCycleHistory in the script). -->
+<div id="modal-host"></div>
+
+<script src="/i18n.js?v=202610282207"></script>
+<script src="/shared.js?v=202610282207"></script>
+<script>
+  const deviceId = new URLSearchParams(location.search).get('id');
+  document.getElementById('logs-link').href = `/logs?id=${encodeURIComponent(deviceId ?? '')}`;
+
+  function applyStaticText() {
+    document.getElementById('breadcrumb-devices').textContent = t('nav.devices');
+    document.getElementById('back-btn-label').textContent = t('nav.back');
+    document.getElementById('logs-link').textContent = t('device.viewLogs');
+    document.getElementById('refresh-btn').textContent = t('device.refresh');
+  }
+
+  // isActive can only be set false→true locally on the device itself (e.g. BOOT
+  // button). The backend/UI is only allowed to deactivate (true→false).
+  async function deactivateDevice(id) {
+    const btn = document.getElementById('deactivate-btn');
+    if (!confirm(t('device.confirmDeactivate'))) return;
+    if (btn) { btn.disabled = true; btn.textContent = t('device.deactivating'); }
+
+    const restoreBtn = () => {
+      if (btn) { btn.disabled = false; btn.textContent = t('device.deactivate'); }
+    };
+    try {
+      const res = await adminFetch(`${API}/devices/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isActive: false }),
+      });
+      if (!res) { restoreBtn(); return; } // token prompt cancelled
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      loadDetail();
+    } catch (e) {
+      alert(t('device.failedToDeactivate', { error: e.message }));
+      restoreBtn();
+    }
+  }
+
+  let heartbeatCountdownTimer = null;
+  let statusCountdownTimer = null;
+  // Last loaded data, reused by the cycle-history modal (see loadDetail).
+  let lastDevice = null;
+  let lastBatteries = [];
+  let lastBatteryLogs = {};
+  let lastSoilPage = null;
+
+  // Live wake countdown next to the Status badge, for devices graded as
+  // sleepers (active, or just-deactivated and still finishing their last
+  // active cycle) — same idea as the heartbeat countdown below. Each tick
+  // also re-renders the badge itself, so online→sleeping→offline
+  // transitions show up live instead of waiting for the next refresh.
+  function startStatusCountdown(device, awakeMs) {
+    clearInterval(statusCountdownTimer);
+    if (!device.lastSeenAt) return;
+    const { cycleMs, asleep } = checkinCycle(device, awakeMs);
+    // Heartbeat-loop devices already have their own countdown (below).
+    if (!asleep) return;
+
+    const lastSeenMs = new Date(device.lastSeenAt).getTime();
+    const tick = () => {
+      const badgeWrap = document.getElementById('status-badge');
+      const label = document.getElementById('status-countdown');
+      if (!badgeWrap || !label) return;
+      badgeWrap.innerHTML = statusBadge(device, awakeMs);
+      const status = deviceStatus(device, awakeMs);
+      if (status !== 'sleeping') { label.textContent = ''; return; }
+      const remaining = Math.round((cycleMs - (Date.now() - lastSeenMs)) / 1000);
+      label.textContent = remaining >= 0
+        ? t('device.status.wakesIn', { s: remaining })
+        : t('device.status.wakeOverdue', { s: -remaining });
+    };
+    tick();
+    statusCountdownTimer = setInterval(tick, 1000);
+  }
+
+  // Live "next heartbeat in ~Ns" label while the device is inactive — the
+  // heartbeat interval is the one thing on this page where "as of last
+  // load" isn't good enough, since the countdown itself is the point.
+  function startHeartbeatCountdown(lastSeenAt, deviceLogsSeconds) {
+    clearInterval(heartbeatCountdownTimer);
+    const label = document.getElementById('heartbeat-label');
+    if (!label || !lastSeenAt) return;
+
+    const lastSeenMs = new Date(lastSeenAt).getTime();
+    const tick = () => {
+      const remaining = Math.round(deviceLogsSeconds - (Date.now() - lastSeenMs) / 1000);
+      label.textContent = remaining > 0 ? t('device.heartbeatNextIn', { s: remaining }) : t('device.heartbeatOverdue');
+    };
+    tick();
+    heartbeatCountdownTimer = setInterval(tick, 1000);
+  }
+
+  // `silent` (the periodic auto-refresh) re-renders in place: no spinner,
+  // a failed fetch keeps the last good content, and an open click-to-edit
+  // input is never blown away mid-edit.
+  async function loadDetail(silent = false) {
+    applyStaticText();
+    const grid = document.getElementById('detail-grid');
+    // Don't redraw under an open edit field or the cycle-history modal —
+    // the modal charts are rendered from the data loaded when it opened.
+    if (silent && (grid.querySelector('.edit-input') || document.querySelector('.modal-backdrop'))) return;
+    clearInterval(heartbeatCountdownTimer);
+    clearInterval(statusCountdownTimer);
+
+    if (!deviceId) {
+      grid.innerHTML = `<div class="error-msg" style="grid-column:1/-1">${t('device.noId')}</div>`;
+      return;
+    }
+
+    if (!silent) grid.innerHTML = '<div class="spinner" style="grid-column:1/-1"></div>';
+
+    try {
+      const [devRes, settingsRes, readingsRes, pumpRes, wateringsRes] = await Promise.allSettled([
+        fetch(`${API}/devices`).then(r => r.json()),
+        fetch(`${API}/devices/${deviceId}/soil-settings`).then(r => r.json()),
+        fetch(`${API}/devices/${deviceId}/soil-readings?limit=${SOIL_PAGE_SIZE}`).then(r => r.json()),
+        fetch(`${API}/devices/${deviceId}/pump-settings`).then(r => r.ok ? r.json() : null),
+        fetch(`${API}/devices/${deviceId}/waterings?limit=${WATERINGS_SHOWN}`).then(r => r.json()),
+      ]);
+
+      const devices = devRes.status === 'fulfilled' ? devRes.value : [];
+      const device  = devices.find(d => d.id === deviceId) || {};
+      const settings = settingsRes.status === 'fulfilled' ? settingsRes.value : null;
+      const readingsPage = readingsRes.status === 'fulfilled'
+        ? readingsRes.value
+        : { items: [], total: 0, hasMore: false };
+      const readings = readingsPage.items || [];
+      const pump = pumpRes.status === 'fulfilled' ? pumpRes.value : null;
+      const waterings = wateringsRes.status === 'fulfilled' ? (wateringsRes.value.items || []) : [];
+
+      document.getElementById('breadcrumb-page').textContent = device.name || device.chipId || t('device.title');
+      document.getElementById('detail-title').textContent = device.name || device.chipId || t('device.title');
+      document.getElementById('detail-sub').textContent =
+        `${device.chipId || ''}${device.lastIp ? ' · ' + device.lastIp : ''}`;
+
+      // Batteries are fetched after we know the device's chipId (they're
+      // scoped to it, not to the UUID id used everywhere else on this page).
+      const batteries = device.chipId
+        ? await fetch(`${API}/battery?deviceChipId=${encodeURIComponent(device.chipId)}`).then(r => r.json()).catch(() => [])
+        : [];
+      // First page only — enough for the card's 3 cycles. The history modal
+      // pages further back on demand. See BATTERY_PAGE_SIZE below.
+      const batteryPages = await Promise.all(
+        batteries.map(b =>
+          fetch(`${API}/battery-logs?batteryId=${b.id}&limit=${BATTERY_PAGE_SIZE}`)
+            .then(r => r.json())
+            .catch(() => ({ items: [], total: 0, hasMore: false }))
+        )
+      );
+      const batteryLogs = batteryPages.map(p => p.items || []);
+
+      // Estimated awake window (soil sampling + esp32-battery sampling +
+      // request overhead) — feeds the status badge and the "Currently"
+      // freshness checks. See awakeWindowMs in shared.js.
+      const awakeMs = awakeWindowMs(settings, batteries);
+
+      // Kept for the cycle-history modal, which opens from a click long
+      // after this fetch and pages further back from here.
+      lastDevice = device;
+      lastBatteries = batteries;
+      lastBatteryLogs = {};
+      batteries.forEach((b, i) => {
+        lastBatteryLogs[b.id] = { ...batteryPages[i], items: batteryLogs[i] };
+      });
+      lastSoilPage = { ...readingsPage, items: readings };
+
+      grid.innerHTML = [
+        cardInfo(device, awakeMs),
+        settings ? cardSoilSettings(settings) : '',
+        pump ? cardPumpSettings(pump, settings) : '',
+        cardWaterings(waterings, pump),
+        ...batteries.map((b, i) => cardBattery(b, batteryLogs[i], device, awakeMs)),
+        cardReadings(readings),
+        ...batteries.map((b) => cardBatteryChart(b, lastBatteryLogs[b.id], device)),
+      ].join('');
+
+      startStatusCountdown(device, awakeMs);
+      if (!device.isActive) startHeartbeatCountdown(device.lastSeenAt, device.deviceLogsSeconds ?? 300);
+
+      renderCycleCharts(soilCycles(), 'soil-cycle');
+
+      batteries.forEach((b) => {
+        renderCycleCharts(batteryCycles(lastBatteryLogs[b.id], device), `battery-cycle-${b.id}`);
+      });
+
+    } catch (e) {
+      if (silent) return;
+      grid.innerHTML = `<div class="error-msg" style="grid-column:1/-1">${t('device.failedToLoad', { error: e.message })}</div>`;
+    }
+  }
+
+  function batteryLabel(type) {
+    if (type === 'esp32') return t('device.battery.esp32');
+    if (type === 'pump') return t('device.battery.pump');
+    return t('device.battery.generic', { type });
+  }
+
+  function cardInfo(d, awakeMs) {
+    const revSynced = d.appliedRevision !== null && d.appliedRevision === d.revision;
+    const revStatus = d.appliedRevision === null ? 'unknown' : revSynced ? 'synced' : 'pending';
+    const revLabel  = d.appliedRevision === null
+      ? t('device.rev.notConfirmed')
+      : revSynced
+        ? t('device.rev.synced', { rev: d.revision })
+        : t('device.rev.pending', { server: d.revision, board: d.appliedRevision });
+
+    return `<div class="card">
+      <div class="card-title">${cardTitle('device', t('device.card.device'))}</div>
+      <div class="field-list">
+        ${field(t('device.field.chipId'), `<span class="field-value mono">${d.chipId || '—'}</span>`, false,
+          t('device.field.chipId.tooltip'))}
+        ${editableField(t('device.field.name'), 'name', d.name || '', `/devices/${d.id}`, 'text', '',
+          t('device.field.name.tooltip'))}
+        ${field(t('device.field.status'),
+          `<span id="status-badge">${statusBadge(d, awakeMs)}</span><span class="status-countdown" id="status-countdown"></span>`, false,
+          t('device.field.status.tooltip'))}
+        ${field(t('device.field.active'), `<span class="badge ${d.isActive ? 'active' : 'inactive'}">${d.isActive ? t('device.field.active.yes') : t('device.field.active.no')}</span>${d.isActive ? `<button class="deactivate-btn" id="deactivate-btn" onclick="deactivateDevice('${d.id}')">${t('device.deactivate')}</button>` : ''}`, false,
+          t('device.field.active.tooltip'))}
+        ${field(t('device.field.ip'), d.lastIp || '—', true,
+          t('device.field.ip.tooltip'))}
+        ${field(t('device.field.firmware'), d.firmwareVersion ? `<span class="badge fw">fw ${d.firmwareVersion}</span>` : '—', false,
+          t('device.field.firmware.tooltip'))}
+        ${field(t('device.field.lastSeen'), exactAge(d.lastSeenAt), false,
+          t('device.field.lastSeen.tooltip'))}
+        ${field(t('device.field.created'), fmtDate(d.createdAt), false,
+          t('device.field.created.tooltip'))}
+        <div class="field-row">
+          <span class="field-label has-tooltip" data-tooltip="${escapeAttr(t('device.field.configRevision.tooltip'))}"
+                onmouseenter="fieldTooltipShow(this)" onmouseleave="fieldTooltipHide()">${t('device.field.configRevision')}</span>
+          <span class="rev-row">
+            <span class="rev-dot ${revStatus}"></span>
+            <span class="field-value">${revLabel}</span>
+          </span>
+        </div>
+        ${editableField(t('device.field.sleepConnected'), 'sleepSeconds', d.sleepSeconds, `/devices/${d.id}`, 'number', ' s',
+          t('device.field.sleepConnected.tooltip'))}
+        ${editableField(
+            d.isActive ? t('device.heartbeatUnused') : `<span id="heartbeat-label">${t('device.heartbeatNextInEllipsis')}</span>`,
+            'deviceLogsSeconds', d.deviceLogsSeconds, `/devices/${d.id}`, 'number', ' s',
+            d.isActive
+              ? t('device.field.heartbeatUnused.tooltip')
+              : t('device.field.heartbeatActive.tooltip'))}
+      </div>
+    </div>`;
+  }
+
+  // Wiring of each battery's voltage divider (config.h): the ADC1 pin that
+  // reads the divider's midpoint, and the GPIO that switches its low side.
+  const BATTERY_PINS = {
+    esp32: { sense: 'GPIO34', enable: 'GPIO26' },
+    pump:  { sense: 'GPIO35', enable: 'GPIO33' },
+  };
+
+  // One card per Battery row (esp32 + pump today; scales to however many
+  // the device has). checkEveryMs/checkAvgCount/batteryAlertPercent are
+  // editable the same way soil settings are — plain PUT on save. `logs` is
+  // this battery's log list (newest-first, from GET /battery-logs) — used
+  // only to read off the latest percentage here, the full history is
+  // charted separately in cardBatteryChart. `device`/`awakeMs` supply the
+  // expected check-in cycle (see expectedCycleMs in shared.js) to judge
+  // whether that latest reading is still fresh enough to trust — it's kept
+  // on screen for two full cycles (the same window after which the device
+  // itself reads as offline), then shown as "—" rather than a number
+  // that's likely no longer true.
+  function cardBattery(b, logs, device, awakeMs) {
+    const latest = logs && logs.length ? logs[0] : null;
+    const staleMs = latest ? Date.now() - new Date(latest.createdAt).getTime() : Infinity;
+    const isFresh = latest && staleMs < expectedCycleMs(device, awakeMs) * 2;
+    return `<div class="card">
+      <div class="card-title">${cardTitle('battery', batteryLabel(b.type))}</div>
+      <div class="field-list">
+        ${field(t('device.battery.field.currently'), isFresh ? `${latest.percentage}%` : '—', false,
+          latest && !isFresh
+            ? t('device.battery.field.currently.stale.tooltip', { pct: latest.percentage, time: relativeTime(latest.createdAt) })
+            : t('device.battery.field.currently.tooltip'))}
+        ${field(t('device.battery.field.type'), `<span class="badge fw">${b.type}</span>`, false,
+          t('device.battery.field.type.tooltip'))}
+        ${BATTERY_PINS[b.type] ? field(t('device.battery.field.sensePin'), `<span class="field-value mono pin-highlight">${BATTERY_PINS[b.type].sense}</span>`, false,
+          t(`device.battery.field.sensePin.${b.type}.tooltip`)) : ''}
+        ${BATTERY_PINS[b.type] ? field(t('device.battery.field.enablePin'), `<span class="field-value mono pin-highlight">${BATTERY_PINS[b.type].enable}</span>`, false,
+          t(`device.battery.field.enablePin.${b.type}.tooltip`)) : ''}
+        ${editableField(t('device.battery.field.checkEvery'), 'checkEveryMs', b.checkEveryMs, `/battery/${b.id}`, 'number', ' ms',
+          t('device.battery.field.checkEvery.tooltip'))}
+        ${editableField(t('device.battery.field.avgCount'), 'checkAvgCount', b.checkAvgCount, `/battery/${b.id}`, 'number', '',
+          t('device.battery.field.avgCount.tooltip'))}
+        ${editableField(t('device.battery.field.alertAt'), 'batteryAlertPercent', b.batteryAlertPercent, `/battery/${b.id}`, 'number', '%',
+          t('device.battery.field.alertAt.tooltip'))}
+        ${field(t('device.battery.field.updated'), fmtDate(b.updatedAt), false,
+          t('device.battery.field.updated.tooltip'))}
+      </div>
+    </div>`;
+  }
+
+  const CYCLES_SHOWN = 3;
+  // Battery logs are fetched 1000 at a time (the API's per-page cap), both
+  // for the card's first page and for each lazy-loaded history page.
+  const BATTERY_PAGE_SIZE = 1000;
+  // Soil readings use a bigger page: one watering cycle covers the whole
+  // watering-to-dry stretch, so it takes far more readings than a battery
+  // cycle to get a few complete ones per page.
+  const SOIL_PAGE_SIZE = 3000;
+
+  // The newest CYCLES_SHOWN cycles, newest last — kept in one place so the
+  // card markup and the chart rendering agree on which cycles there are and
+  // what index each one has. `page` is a {items, hasMore} response.
+  function batteryCycles(page, device) {
+    const cycles = splitLoadedBatteryCycles(page?.items || [], device, page?.hasMore);
+    return cycles.slice(-CYCLES_SHOWN);
+  }
+
+  // Battery logs and soil readings name their percentage and timestamp
+  // fields differently; everything below works off whichever shape a cycle
+  // has, so the same markup and charts serve both.
+  const cyclePct = (r) => (r.percentage ?? r.percent);
+  const cycleAt = (r) => (r.createdAt ?? r.recordedAt);
+
+  // Markup for one cycle's chart slot. `idPrefix` separates the card's
+  // charts from the modal's, so both can be on the page at once without
+  // their container ids colliding.
+  function cycleCol(cycle, idPrefix, ci) {
+    const first = cycle[0], last = cycle[cycle.length - 1];
+    const startMs = new Date(cycleAt(first)).getTime();
+    const endMs = new Date(cycleAt(last)).getTime();
+    return `
+      <div class="cycle-col">
+        <div class="cycle-head">
+          <span class="cycle-span">${formatDuration(endMs - startMs)}</span>
+          <span class="cycle-drop">${cyclePct(first)}% → ${cyclePct(last)}%</span>
+        </div>
+        <div class="cycle-dates">${fmtDate(cycleAt(first))} — ${fmtDate(cycleAt(last))}</div>
+        <div id="${idPrefix}-${ci}"></div>
+      </div>`;
+  }
+
+  // Shared chart options for every cycle chart, on the card and in the
+  // modal. Battery cycles add a voltage row to the tooltip; soil cycles add
+  // the raw ADC value.
+  function cycleChartOpts() {
+    return {
+      // Each cycle sits in a ~1/3-width column (~440px on a desktop page).
+      // The SVG scales to its container with preserveAspectRatio="none", so
+      // the viewBox is matched to the real column width: that keeps the
+      // labels at their intended px size, and the height is then picked so
+      // the charts render as tall as the full-width moisture chart (which
+      // draws a 900x260 box across ~1360px, i.e. roughly 390px tall).
+      width: 440,
+      height: 390,
+      emptyLabel: t('chart.noBatteryLogsYet'),
+      valueLabel: (p) => `${p.pct}%`,
+      tooltip: (p) => [
+        [t('chart.tooltip.time'), fmtDate(cycleAt(p))],
+        ...(p.volt != null ? [[t('chart.tooltip.voltage'), `${p.volt.toFixed(2)} V`]] : []),
+        ...(p.raw != null ? [[t('chart.tooltip.raw'), p.raw]] : []),
+      ],
+    };
+  }
+
+  // `from` skips cycles already drawn, so an appended page only renders its
+  // own charts.
+  function renderCycleCharts(cycles, idPrefix, from = 0) {
+    for (let ci = from; ci < cycles.length; ci++) {
+      renderPercentChart(
+        `${idPrefix}-${ci}`,
+        cycles[ci].map(r => ({ ...r, pct: cyclePct(r) })),
+        cycleChartOpts(),
+      );
+    }
+  }
+
+  // One chart per charge cycle, laid out 3 per row, so each cycle reads as
+  // "how long did one charge last" rather than being lost in a single run-on
+  // history. Cycle boundaries come from splitBatteryCycles (shared.js); the
+  // full history opens in a modal (openCycleHistory below).
+  function cardBatteryChart(b, page, device) {
+    const loaded = splitLoadedBatteryCycles(page?.items || [], device, page?.hasMore);
+    const cycles = batteryCycles(page, device);
+    const title = t('device.battery.cyclesTitle', { label: batteryLabel(b.type) });
+    // Nothing to open when every loaded cycle already fits in the card and
+    // there's nothing older left to fetch.
+    const historyBtn = loaded.length > CYCLES_SHOWN || page?.hasMore
+      ? `<button class="btn-secondary" onclick="openCycleHistory(${b.id})">${t('device.battery.history')}</button>`
+      : '';
+
+    if (!cycles.length) {
+      return `<div class="card readings-card">
+        <div class="card-title">${title}</div>
+        <div class="chart-empty">${t('chart.noBatteryLogsYet')}</div>
+      </div>`;
+    }
+
+    return `<div class="card readings-card">
+      <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <span>${title}</span>
+        ${historyBtn}
+      </div>
+      <div class="cycle-row">${cycles.map((c, ci) => cycleCol(c, `battery-cycle-${b.id}`, ci)).join('')}</div>
+    </div>`;
+  }
+
+  // Cycle history in a modal, newest first (the card reads oldest-to-newest
+  // left to right, but a long history is more useful starting from the most
+  // recent charge). Older pages load lazily as the list is scrolled.
+  let historyBatteryId = null;
+  let historyObserver = null;
+  // Cycles already in the DOM, so a newly loaded page only appends its own
+  // charts instead of re-rendering (and re-measuring) everything above.
+  let historyShownCount = 0;
+  // The open history's source: which page object to read and extend, how to
+  // split it into cycles, and how to label it. Battery and soil differ only
+  // in these details, so they share the whole modal below.
+  let historySource = null;
+
+  function batteryHistorySource(batteryId) {
+    const b = (lastBatteries || []).find(x => x.id === batteryId);
+    if (!b) return null;
+    return {
+      key: `battery-${batteryId}`,
+      page: () => lastBatteryLogs[batteryId],
+      split: (items, hasMore) => splitLoadedBatteryCycles(items, lastDevice, hasMore),
+      title: (count) => t('device.battery.cyclesTitleAll', { label: batteryLabel(b.type), count }),
+      url: (offset) => `${API}/battery-logs?batteryId=${batteryId}&limit=${BATTERY_PAGE_SIZE}&offset=${offset}`,
+    };
+  }
+
+  function soilHistorySource() {
+    if (!lastSoilPage) return null;
+    return {
+      key: 'soil',
+      page: () => lastSoilPage,
+      split: (items, hasMore) => splitLoadedSoilCycles(items, lastDevice, hasMore),
+      title: (count) => t('device.soil.cyclesTitleAll', { count }),
+      url: (offset) => `${API}/devices/${deviceId}/soil-readings?limit=${SOIL_PAGE_SIZE}&offset=${offset}`,
+    };
+  }
+
+  function openCycleHistory(batteryId) {
+    openHistory(batteryHistorySource(batteryId));
+  }
+
+  function openSoilHistory() {
+    openHistory(soilHistorySource());
+  }
+
+  function openHistory(source) {
+    if (!source || !source.page()) return;
+    historySource = source;
+    historyShownCount = 0;
+    renderCycleHistory();
+    document.body.style.overflow = 'hidden';
+  }
+
+  // Charts are rendered after the markup is in the DOM, since
+  // renderPercentChart measures its container.
+  function renderCycleHistory() {
+    const host = document.getElementById('modal-host');
+    if (!historySource) { host.innerHTML = ''; return; }
+
+    const cycles = historyCycles();
+    const idPrefix = historyIdPrefix();
+    host.innerHTML = `
+      <div class="modal-backdrop" onclick="if (event.target === this) closeCycleHistory()">
+        <div class="modal">
+          <div class="modal-header">
+            <span class="modal-title" id="history-title">${historySource.title(cycles.length)}</span>
+            <button class="modal-close" onclick="closeCycleHistory()" aria-label="${t('device.battery.hideHistory')}">×</button>
+          </div>
+          <div class="modal-body" id="history-body">
+            <div class="cycle-row" id="history-row">${cycles.map((c, ci) => cycleCol(c, idPrefix, ci)).join('')}</div>
+            <div class="modal-footer" id="history-footer">${historyFooter()}</div>
+          </div>
+        </div>
+      </div>`;
+    renderCycleCharts(cycles, idPrefix);
+    historyShownCount = cycles.length;
+    observeHistorySentinel();
+  }
+
+  function historyIdPrefix() {
+    return `history-cycle-${historySource.key}`;
+  }
+
+  // Cycles for the modal: newest first, with the partial oldest one already
+  // held back by the source's split function.
+  function historyCycles() {
+    const page = historySource.page();
+    return historySource.split(page.items, page.hasMore).reverse();
+  }
+
+  function historyFooter() {
+    const page = historySource.page();
+    if (page.error) {
+      return `<span class="error-msg">${t('device.failedToLoad', { error: page.error })}</span>`;
+    }
+    // The sentinel is what the observer watches: once it scrolls into view
+    // the next page is fetched, so the spinner doubles as the trigger.
+    if (page.hasMore) {
+      return `<div class="cycle-sentinel" id="history-sentinel">
+        <div class="spinner"></div>
+        <span class="cycle-all-loaded">${t('device.battery.loading')}</span>
+      </div>`;
+    }
+    return `<span class="cycle-all-loaded">${t('device.battery.allLoaded', { count: historyShownCount })}</span>`;
+  }
+
+  // Appends newly loaded cycles in place, leaving the existing charts (and
+  // the scroll position) untouched. The previously oldest cycle is re-drawn
+  // when a page completes it: it was held back as partial, so what used to
+  // be the last chart can now be a different, longer cycle.
+  function appendHistoryCycles() {
+    const row = document.getElementById('history-row');
+    if (!historySource || !row) return;
+
+    const cycles = historyCycles();
+    const idPrefix = historyIdPrefix();
+    // Re-render from one before the previous end, since that cycle may have
+    // grown now that older readings arrived.
+    const from = Math.max(0, historyShownCount - 1);
+    for (let ci = from; ci < cycles.length; ci++) {
+      const existing = document.getElementById(`${idPrefix}-${ci}`);
+      if (existing) {
+        existing.closest('.cycle-col').outerHTML = cycleCol(cycles[ci], idPrefix, ci);
+      } else {
+        row.insertAdjacentHTML('beforeend', cycleCol(cycles[ci], idPrefix, ci));
+      }
+    }
+    renderCycleCharts(cycles, idPrefix, from);
+    historyShownCount = cycles.length;
+
+    document.getElementById('history-title').textContent = historySource.title(cycles.length);
+    document.getElementById('history-footer').innerHTML = historyFooter();
+    observeHistorySentinel();
+  }
+
+  // Watches the sentinel at the end of the list; scrolling it into view
+  // loads the next page. rootMargin starts the fetch a little before it is
+  // actually reached, so scrolling stays smooth.
+  function observeHistorySentinel() {
+    historyObserver?.disconnect();
+    const sentinel = document.getElementById('history-sentinel');
+    const body = document.getElementById('history-body');
+    if (!sentinel || !body) return;
+
+    historyObserver = new IntersectionObserver((entries) => {
+      if (entries.some(e => e.isIntersecting)) loadMoreCycles();
+    }, { root: body, rootMargin: '300px' });
+    historyObserver.observe(sentinel);
+  }
+
+  // Fetches the next page for the open history. Pages are fetched by offset
+  // over a newest-first ordering, so each one reaches further back in time;
+  // the accumulated items stay in that order, which is what the split
+  // functions expect.
+  async function loadMoreCycles() {
+    const page = historySource?.page();
+    if (!page || !page.hasMore || page.loading) return;
+
+    page.loading = true;
+    // Stop observing while in flight, so one scroll doesn't queue several
+    // fetches for the same offset.
+    historyObserver?.disconnect();
+    try {
+      const next = await fetch(historySource.url(page.items.length)).then(r => r.json());
+      page.items = page.items.concat(next.items || []);
+      page.total = next.total;
+      page.hasMore = next.hasMore;
+      page.error = null;
+    } catch (e) {
+      page.error = e.message;
+      page.hasMore = false; // don't retry in a loop; the message is shown
+    } finally {
+      page.loading = false;
+      // The modal may have been closed mid-fetch.
+      if (historySource) appendHistoryCycles();
+    }
+  }
+
+  function closeCycleHistory() {
+    historyObserver?.disconnect();
+    historyObserver = null;
+    historySource = null;
+    historyShownCount = 0;
+    document.getElementById('modal-host').innerHTML = '';
+    document.body.style.overflow = '';
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeCycleHistory();
+  });
+
+  function cardSoilSettings(s) {
+    const revSynced = s.appliedRevision !== null && s.appliedRevision === s.revision;
+    const revStatus = s.appliedRevision === null ? 'unknown' : revSynced ? 'synced' : 'pending';
+    const revLabel  = s.appliedRevision === null
+      ? t('device.rev.notConfirmed')
+      : revSynced
+        ? t('device.rev.synced', { rev: s.revision })
+        : t('device.rev.pendingShort', { server: s.revision, board: s.appliedRevision });
+
+    return `<div class="card">
+      <div class="card-title">${cardTitle('soil', t('device.soil.title'))}</div>
+      <div class="field-list">
+        ${field(t('device.soil.field.sensePin'), `<span class="field-value mono pin-highlight">GPIO32</span>`, false,
+          t('device.soil.field.sensePin.tooltip'))}
+        ${field(t('device.soil.field.powerPin'), `<span class="field-value mono pin-highlight">GPIO25</span>`, false,
+          t('device.soil.field.powerPin.tooltip'))}
+        ${editableField(t('device.soil.field.dryRaw'), 'soilDry', s.soilDry, `/devices/${s.deviceId}/soil-settings`, 'number', '',
+          t('device.soil.field.dryRaw.tooltip'))}
+        ${editableField(t('device.soil.field.wetRaw'), 'soilWet', s.soilWet, `/devices/${s.deviceId}/soil-settings`, 'number', '',
+          t('device.soil.field.wetRaw.tooltip'))}
+        ${editableField(t('device.soil.field.readEvery'), 'soilEveryMs', s.soilEveryMs, `/devices/${s.deviceId}/soil-settings`, 'number', ' ms',
+          t('device.soil.field.readEvery.tooltip'))}
+        ${editableField(t('device.soil.field.avgCount'), 'soilAvgCount', s.soilAvgCount, `/devices/${s.deviceId}/soil-settings`, 'number', '',
+          t('device.soil.field.avgCount.tooltip'))}
+        ${editableField(t('device.soil.field.dryAlertAt'), 'dryAlertPercent', s.dryAlertPercent, `/devices/${s.deviceId}/soil-settings`, 'number', '%',
+          t('device.soil.field.dryAlertAt.tooltip'))}
+        ${editableField(t('device.soil.field.autoWaterAt'), 'autoWaterPercent', s.autoWaterPercent, `/devices/${s.deviceId}/soil-settings`, 'number', '%',
+          t('device.soil.field.autoWaterAt.tooltip'))}
+        <div class="field-row">
+          <span class="field-label has-tooltip" data-tooltip="${escapeAttr(t('device.soil.field.revision.tooltip'))}"
+                onmouseenter="fieldTooltipShow(this)" onmouseleave="fieldTooltipHide()">${t('device.soil.field.revision')}</span>
+          <span class="rev-row">
+            <span class="rev-dot ${revStatus}"></span>
+            <span class="field-value">${revLabel}</span>
+          </span>
+        </div>
+        ${field(t('device.soil.field.updated'), fmtDate(s.updatedAt), false,
+          t('device.soil.field.updated.tooltip'))}
+      </div>
+    </div>`;
+  }
+
+  // Same revision dot as the soil card: server revision vs. what the board
+  // confirmed applying on its last sync.
+  function cardPumpSettings(p, soil) {
+    const revSynced = p.appliedRevision !== null && p.appliedRevision === p.revision;
+    const revStatus = p.appliedRevision === null ? 'unknown' : revSynced ? 'synced' : 'pending';
+    const revLabel  = p.appliedRevision === null
+      ? t('device.rev.notConfirmed')
+      : revSynced
+        ? t('device.rev.synced', { rev: p.revision })
+        : t('device.rev.pendingShort', { server: p.revision, board: p.appliedRevision });
+    const url = `/devices/${p.deviceId}/pump-settings`;
+    // Exactly what the board will do: dose / flow, capped by maxPumpSeconds.
+    const runSec = Math.min(p.waterMl / p.flowMlPerSec, p.maxPumpSeconds);
+
+    return `<div class="card">
+      <div class="card-title">${cardTitle('pump', t('device.pump.title'))}</div>
+      <div class="field-list">
+        ${field(t('device.pump.field.keyPin'), `<span class="field-value mono pin-highlight">GPIO27</span>`, false,
+          t('device.pump.field.keyPin.tooltip'))}
+        ${editableField(t('device.pump.field.enabled'), 'autoWaterEnabled', p.autoWaterEnabled, url, 'checkbox', '',
+          t('device.pump.field.enabled.tooltip'))}
+        ${soil ? field(t('device.pump.field.trigger'), `≤ ${soil.autoWaterPercent}%`, false,
+          t('device.pump.field.trigger.tooltip')) : ''}
+        ${editableField(t('device.pump.field.waterMl'), 'waterMl', p.waterMl, url, 'number', ' ml',
+          t('device.pump.field.waterMl.tooltip'))}
+        ${editableField(t('device.pump.field.flow'), 'flowMlPerSec', p.flowMlPerSec, url, 'number', ' ml/s',
+          t('device.pump.field.flow.tooltip'))}
+        ${field(t('device.pump.field.runTime'), `${runSec.toFixed(1)} s`, false,
+          t('device.pump.field.runTime.tooltip'))}
+        ${editableField(t('device.pump.field.maxPumpSeconds'), 'maxPumpSeconds', p.maxPumpSeconds, url, 'number', ' s',
+          t('device.pump.field.maxPumpSeconds.tooltip'))}
+        ${editableField(t('device.pump.field.postWaterSleep'), 'postWaterSleepSeconds', p.postWaterSleepSeconds, url, 'number', ' s',
+          t('device.pump.field.postWaterSleep.tooltip'))}
+        ${editableField(t('device.pump.field.maxPerDay'), 'maxWateringsPerDay', p.maxWateringsPerDay, url, 'number', '',
+          t('device.pump.field.maxPerDay.tooltip'))}
+        ${editableField(t('device.pump.field.minBatteryVolt'), 'minBatteryVolt', p.minBatteryVolt, url, 'number', ' V',
+          t('device.pump.field.minBatteryVolt.tooltip'))}
+        <div class="field-row">
+          <span class="field-label has-tooltip" data-tooltip="${escapeAttr(t('device.pump.field.revision.tooltip'))}"
+                onmouseenter="fieldTooltipShow(this)" onmouseleave="fieldTooltipHide()">${t('device.pump.field.revision')}</span>
+          <span class="rev-row">
+            <span class="rev-dot ${revStatus}"></span>
+            <span class="field-value">${revLabel}</span>
+          </span>
+        </div>
+        ${field(t('device.pump.field.updated'), fmtDate(p.updatedAt), false,
+          t('device.pump.field.updated.tooltip'))}
+      </div>
+    </div>`;
+  }
+
+  // Newest-first list from GET /devices/:id/waterings. The header rows sum
+  // up the latest watering; the table lists the last WATERINGS_SHOWN.
+  const WATERINGS_SHOWN = 8;
+
+  function cardWaterings(items, pump) {
+    const title = `<div class="card-title">${cardTitle('water', t('device.waterings.title'))}</div>`;
+    if (!items.length) {
+      return `<div class="card">${title}<div class="chart-empty">${t('device.waterings.none')}</div></div>`;
+    }
+    const last = items[0];
+    const dayAgo = Date.now() - 24 * 3600 * 1000;
+    const today = items.filter(w => new Date(w.wateredAt).getTime() > dayAgo).length;
+    const moisture = (w) => `${w.moistureBefore != null ? `${w.moistureBefore}%` : '—'} → ${w.moistureAfter != null ? `${w.moistureAfter}%` : '…'}`;
+
+    const rows = items.map(w => `<tr>
+        <td>${fmtDate(w.wateredAt)}${w.offline ? ` <span class="badge fw">${t('device.waterings.offline')}</span>` : ''}</td>
+        <td>${w.ml}</td>
+        <td>${w.seconds.toFixed(1)}</td>
+        <td>${moisture(w)}</td>
+        <td>${w.pumpBatteryVolt != null ? w.pumpBatteryVolt.toFixed(2) : '—'}</td>
+      </tr>`).join('');
+
+    return `<div class="card">
+      ${title}
+      <div class="field-list">
+        ${field(t('device.waterings.last'), exactAge(last.wateredAt), false,
+          t('device.waterings.last.tooltip'))}
+        ${field(t('device.waterings.dose'), `${last.ml} ml · ${last.seconds.toFixed(1)} s`, false,
+          t('device.waterings.dose.tooltip'))}
+        ${field(t('device.waterings.moisture'), moisture(last), false,
+          t('device.waterings.moisture.tooltip'))}
+        ${field(t('device.waterings.today'), pump ? `${today} / ${pump.maxWateringsPerDay}` : today, false,
+          t('device.waterings.today.tooltip'))}
+      </div>
+      <div class="readings-wrap waterings-table">
+        <table>
+          <thead><tr>
+            <th>${t('device.waterings.col.time')}</th>
+            <th>${t('device.waterings.col.ml')}</th>
+            <th>${t('device.waterings.col.seconds')}</th>
+            <th>${t('device.waterings.col.moisture')}</th>
+            <th>${t('device.waterings.col.battery')}</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }
+
+  function cardReadings(readings) {
+    return `<div class="card readings-card">
+      <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+        <span>${t('device.readings.title', { count: readings.length })}</span>
+        ${soilHistoryBtn()}
+      </div>
+      ${soilCycleRow()}
+    </div>`;
+  }
+
+  // The newest CYCLES_SHOWN watering cycles, newest last — same shape as
+  // batteryCycles, so the card markup and chart rendering stay in step.
+  function soilCycles() {
+    const page = lastSoilPage;
+    if (!page) return [];
+    return splitLoadedSoilCycles(page.items || [], lastDevice, page.hasMore).slice(-CYCLES_SHOWN);
+  }
+
+  // Chart view shows one chart per watering cycle rather than a single
+  // run-on line, so each cycle reads as "how long did the soil take to dry
+  // out after this watering". Full history is in the modal.
+  function soilCycleRow() {
+    const cycles = soilCycles();
+    if (!cycles.length) return `<div class="chart-empty">${t('chart.noReadingsYet')}</div>`;
+    return `<div class="cycle-row">${cycles.map((c, ci) => cycleCol(c, 'soil-cycle', ci)).join('')}</div>`;
+  }
+
+  // Watering cycles (moisture rising 30+ points = watered) open in the same
+  // modal the battery history uses. Shown whenever there's more than one
+  // cycle to compare, or older readings left to fetch.
+  function soilHistoryBtn() {
+    const page = lastSoilPage;
+    if (!page) return '';
+    const cycles = splitLoadedSoilCycles(page.items || [], lastDevice, page.hasMore);
+    if (cycles.length < 2 && !page.hasMore) return '';
+    return `<button class="btn-secondary" onclick="openSoilHistory()">${t('device.battery.history')}</button>`;
+  }
+
+  window.onLangChange = loadDetail;
+  renderLangSwitcher();
+  loadDetail();
+  // Status and freshness windows decay with wall-clock time even when no
+  // new data arrives, so re-render periodically (in place, edit-safe).
+  setInterval(() => loadDetail(true), 30000);
+</script>
+</body>
+</html>
