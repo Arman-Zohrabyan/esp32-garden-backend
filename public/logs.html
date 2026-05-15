@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Device Logs — ESP32 Dashboard</title>
+  <link rel="stylesheet" href="/shared.css?v=202610282207" />
+</head>
+<body>
+
+<header>
+  <a class="logo" href="/">ESP32</a>
+  <div class="breadcrumb">
+    <span class="sep">/</span>
+    <a href="/" id="breadcrumb-devices">Devices</a>
+    <span class="sep">/</span>
+    <a id="breadcrumb-device" href="/device">Device</a>
+    <span class="sep">/</span>
+    <span class="active" id="breadcrumb-logs">Logs</span>
+  </div>
+  <div id="lang-switch"></div>
+  <a class="back-btn" id="back-btn" href="/device">← Back</a>
+</header>
+
+<main>
+  <div class="page-title" id="page-title">Device Logs</div>
+  <div class="page-sub" id="logs-sub"></div>
+  <div class="header-actions">
+    <button class="refresh-btn" style="margin:0" onclick="loadLogs()" id="refresh-btn">Refresh</button>
+  </div>
+
+  <div class="filter-bar">
+    <div class="filter-field">
+      <label for="filter-level" id="filter-level-label">Level</label>
+      <select id="filter-level" onchange="onFilterChange()">
+        <option value="" id="filter-level-all">All</option>
+        <option value="info" id="filter-level-info">Info</option>
+        <option value="warn" id="filter-level-warn">Warn</option>
+        <option value="error" id="filter-level-error">Error</option>
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="filter-event" id="filter-event-label">Event</label>
+      <select id="filter-event" onchange="onFilterChange()">
+        <option value="" id="filter-event-all">All</option>
+      </select>
+    </div>
+    <!-- Clicking anywhere in the field opens the native calendar, not just
+         the tiny picker icon. showPicker() needs a user gesture (the click
+         provides one) and isn't in ancient browsers — hence the try/catch:
+         worst case the field just behaves like a plain date input. -->
+    <div class="filter-field">
+      <label for="filter-from" id="filter-from-label">From</label>
+      <input type="date" id="filter-from" onchange="onFilterChange()"
+             onclick="try { this.showPicker(); } catch (e) {}" />
+    </div>
+    <div class="filter-field">
+      <label for="filter-to" id="filter-to-label">To</label>
+      <input type="date" id="filter-to" onchange="onFilterChange()"
+             onclick="try { this.showPicker(); } catch (e) {}" />
+    </div>
+    <label class="filter-toggle" id="filter-nvs-toggle">
+      <input type="checkbox" id="filter-nvs" onchange="onFilterChange()" />
+      <span id="filter-nvs-label">NVS only</span>
+    </label>
+    <button class="btn-secondary" onclick="clearFilters()" id="clear-filters-btn">Clear filters</button>
+  </div>
+
+  <div id="logs-container"></div>
+  <div id="pagination-container"></div>
+</main>
+
+<script src="/i18n.js?v=202610282207"></script>
+<script src="/shared.js?v=202610282207"></script>
+<script>
+  const deviceId = new URLSearchParams(location.search).get('id');
+  document.getElementById('breadcrumb-device').href = `/device?id=${encodeURIComponent(deviceId ?? '')}`;
+  document.getElementById('back-btn').href = `/device?id=${encodeURIComponent(deviceId ?? '')}`;
+
+  function applyStaticText() {
+    document.getElementById('breadcrumb-devices').textContent = t('nav.devices');
+    document.getElementById('breadcrumb-logs').textContent = t('nav.logs');
+    document.getElementById('back-btn').textContent = t('nav.back');
+    document.getElementById('refresh-btn').textContent = t('logs.refresh');
+    document.getElementById('filter-level-label').textContent = t('logs.filter.level');
+    document.getElementById('filter-level-all').textContent = t('logs.filter.all');
+    document.getElementById('filter-level-info').textContent = t('logs.filter.info');
+    document.getElementById('filter-level-warn').textContent = t('logs.filter.warn');
+    document.getElementById('filter-level-error').textContent = t('logs.filter.error');
+    document.getElementById('filter-event-label').textContent = t('logs.filter.event');
+    document.getElementById('filter-event-all').textContent = t('logs.filter.all');
+    document.getElementById('filter-from-label').textContent = t('logs.filter.from');
+    document.getElementById('filter-to-label').textContent = t('logs.filter.to');
+    document.getElementById('filter-nvs-label').textContent = t('logs.filter.nvsOnly');
+    document.getElementById('clear-filters-btn').textContent = t('logs.filter.clear');
+  }
+
+  const PAGE_SIZE = 100;
+
+  // Filter/page state lives in the URL query string (readable/bookmarkable,
+  // survives refresh) rather than only in memory.
+  function getState() {
+    const p = new URLSearchParams(location.search);
+    return {
+      level: p.get('level') || '',
+      event: p.get('event') || '',
+      from: p.get('from') || '',
+      to: p.get('to') || '',
+      nvs: p.get('nvs') === '1',
+      page: Math.max(1, parseInt(p.get('page') || '1', 10) || 1),
+    };
+  }
+
+  function setState(patch) {
+    const p = new URLSearchParams(location.search);
+    for (const [k, v] of Object.entries(patch)) {
+      if (v) p.set(k, v); else p.delete(k);
+    }
+    history.replaceState(null, '', `${location.pathname}?${p.toString()}`);
+  }
+
+  function onFilterChange() {
+    setState({
+      level: document.getElementById('filter-level').value,
+      event: document.getElementById('filter-event').value,
+      from: document.getElementById('filter-from').value,
+      to: document.getElementById('filter-to').value,
+      nvs: document.getElementById('filter-nvs').checked ? '1' : '',
+      page: '', // any filter change resets to page 1
+    });
+    loadLogs();
+  }
+
+  function clearFilters() {
+    const p = new URLSearchParams();
+    if (deviceId) p.set('id', deviceId);
+    history.replaceState(null, '', `${location.pathname}?${p.toString()}`);
+    applyStateToControls();
+    loadLogs();
+  }
+
+  function goToPage(page) {
+    setState({ page: String(page) });
+    loadLogs();
+  }
+
+  function applyStateToControls() {
+    const s = getState();
+    document.getElementById('filter-level').value = s.level;
+    document.getElementById('filter-event').value = s.event;
+    document.getElementById('filter-from').value = s.from;
+    document.getElementById('filter-to').value = s.to;
+    document.getElementById('filter-nvs').checked = s.nvs;
+    document.getElementById('filter-nvs-toggle').classList.toggle('active', s.nvs);
+  }
+
+  async function loadDeviceName() {
+    if (!deviceId) return;
+    try {
+      const devices = await fetch(`${API}/devices`).then(r => r.json());
+      const device = devices.find(d => d.id === deviceId);
+      const label = device ? (device.name || device.chipId) : t('nav.unknownDevice');
+      document.getElementById('breadcrumb-device').textContent = label;
+      document.getElementById('page-title').textContent = t('logs.titleWithDevice', { device: label });
+    } catch {
+      // breadcrumb/title just keep their fallback text
+    }
+  }
+
+  const LEVEL_LABEL = { info: 'INFO', warn: 'WARN', error: 'ERROR' };
+
+  // Every event name seen so far gets an option in the Event filter — no
+  // fixed enum, since `event` is freeform per the jsonb info column.
+  const KNOWN_EVENTS = [
+    'heartbeat', 'boot', 'cycle_done', 'wifi_failed', 'ping_failed',
+    'sensor_disconnected', 'config_applied', 'nvs_wear',
+  ];
+
+  function populateEventOptions() {
+    const select = document.getElementById('filter-event');
+    const current = select.value;
+    KNOWN_EVENTS.forEach(ev => {
+      if (!select.querySelector(`option[value="${ev}"]`)) {
+        const opt = document.createElement('option');
+        opt.value = ev;
+        opt.textContent = ev;
+        select.appendChild(opt);
+      }
+    });
+    select.value = current;
+  }
+
+  // Fields worth surfacing directly in the summary column per event type,
+  // beyond the always-shown level/event/time. Anything else is still visible
+  // via the expandable raw JSON.
+  const SUMMARY_FIELDS = {
+    heartbeat: ['rssi', 'freeHeap', 'soilPercent', 'ip', 'nvsWrites', 'nvsWearPct'],
+    boot: ['reason', 'bootCount', 'fwVersion'],
+    cycle_done: ['awakeMs', 'freeHeap', 'minFreeHeap', 'rssi', 'nvsWrites', 'nvsWearPct'],
+    wifi_failed: ['ssid', 'status', 'waitedMs'],
+    ping_failed: ['httpCode', 'error', 'url'],
+    sensor_disconnected: ['raw', 'minRaw', 'maxRaw', 'spread'],
+    config_applied: ['revision', 'prevRevision'],
+    nvs_wear: ['nvsWrites', 'nvsWearPct', 'threshold', 'endurance'],
+  };
+
+  function summarize(info) {
+    const keys = SUMMARY_FIELDS[info.event] || Object.keys(info).filter(k => !['chipId', 'level', 'event'].includes(k)).slice(0, 4);
+    return keys
+      .filter(k => info[k] !== undefined)
+      .map(k => `${k}=${JSON.stringify(info[k])}`)
+      .join('  ');
+  }
+
+  async function loadLogs() {
+    applyStaticText();
+    const container = document.getElementById('logs-container');
+    const pagContainer = document.getElementById('pagination-container');
+    const sub = document.getElementById('logs-sub');
+
+    if (!deviceId) {
+      container.innerHTML = `<div class="error-msg">${t('logs.noId')}</div>`;
+      return;
+    }
+
+    applyStateToControls();
+    container.innerHTML = '<div class="spinner"></div>';
+    pagContainer.innerHTML = '';
+
+    const s = getState();
+    const params = new URLSearchParams({ deviceId, page: String(s.page), limit: String(PAGE_SIZE) });
+    if (s.level) params.set('level', s.level);
+    if (s.event) params.set('event', s.event);
+    if (s.from) params.set('from', s.from);
+    if (s.to) params.set('to', `${s.to}T23:59:59.999Z`);
+    if (s.nvs) params.set('keyLike', 'nvs');
+
+    try {
+      const res = await fetch(`${API}/device-logs?${params.toString()}`);
+      const { items: logs, total, page, limit } = await res.json();
+      const start = total === 0 ? 0 : (page - 1) * limit + 1;
+      const end = Math.min(total, page * limit);
+      sub.textContent = total
+        ? t('logs.showing', { start, end, total, count: total })
+        : t('logs.zeroEntries');
+
+      if (!logs.length) {
+        container.innerHTML = `<div class="empty"><div class="icon">📋</div><div class="msg">${t('logs.empty')}</div></div>`;
+        return;
+      }
+
+      container.innerHTML = `
+        <div class="card readings-card">
+          <div class="readings-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>${t('logs.col.time')}</th>
+                  <th>${t('logs.col.level')}</th>
+                  <th>${t('logs.col.event')}</th>
+                  <th>${t('logs.col.details')}</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>${logs.map(logRow).join('')}</tbody>
+            </table>
+          </div>
+        </div>`;
+
+      const totalPages = Math.max(1, Math.ceil(total / limit));
+      pagContainer.innerHTML = `
+        <div class="pagination">
+          <span class="pagination-info">${t('logs.page', { page, total: totalPages })}</span>
+          <div class="pagination-controls">
+            <button class="btn-secondary" onclick="goToPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>${t('logs.prev')}</button>
+            <button class="btn-secondary" onclick="goToPage(${page + 1})" ${page >= totalPages ? 'disabled' : ''}>${t('logs.next')}</button>
+          </div>
+        </div>`;
+    } catch (e) {
+      container.innerHTML = `<div class="error-msg">${t('logs.failedToLoad', { error: e.message })}</div>`;
+      sub.textContent = '';
+    }
+  }
+
+  function logRow(log) {
+    const info = log.info || {};
+    const level = info.level || 'info';
+    const rowId = `raw-${log.id}`;
+    return `
+      <tr>
+        <td>${fmtDate(log.createdAt)}</td>
+        <td><span class="badge level-${level}">${LEVEL_LABEL[level] || level}</span></td>
+        <td class="log-event">${info.event || '—'}</td>
+        <td class="log-summary">${summarize(info)}</td>
+        <td><button class="log-toggle" onclick="toggleRaw('${rowId}')">JSON</button></td>
+      </tr>
+      <tr id="${rowId}" class="log-details" style="display:none">
+        <td colspan="5"><pre>${JSON.stringify(info, null, 2)}</pre></td>
+      </tr>`;
+  }
+
+  function toggleRaw(rowId) {
+    const row = document.getElementById(rowId);
+    row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+  }
+
+  window.onLangChange = () => { loadDeviceName(); loadLogs(); };
+  renderLangSwitcher();
+  populateEventOptions();
+  loadDeviceName();
+  loadLogs();
+</script>
+</body>
+</html>
