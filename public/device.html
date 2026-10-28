@@ -308,6 +308,10 @@
           latest && !isFresh
             ? t('device.battery.field.currently.stale.tooltip', { pct: latest.percentage, time: relativeTime(latest.createdAt) })
             : t('device.battery.field.currently.tooltip'))}
+        ${field(t('device.battery.field.voltage'), latest ? `${latest.volt.toFixed(2)} V` : '—', false,
+          latest && latest.rawVolt !== latest.volt
+            ? t('device.battery.field.voltage.calibrated.tooltip', { raw: latest.rawVolt.toFixed(2), calib: b.voltCalib })
+            : t('device.battery.field.voltage.tooltip'))}
         ${field(t('device.battery.field.type'), `<span class="badge fw">${b.type}</span>`, false,
           t('device.battery.field.type.tooltip'))}
         ${BATTERY_PINS[b.type] ? field(t('device.battery.field.sensePin'), `<span class="field-value mono pin-highlight">${BATTERY_PINS[b.type].sense}</span>`, false,
@@ -320,6 +324,10 @@
           t('device.battery.field.avgCount.tooltip'))}
         ${editableField(t('device.battery.field.alertAt'), 'batteryAlertPercent', b.batteryAlertPercent, `/battery/${b.id}`, 'number', '%',
           t('device.battery.field.alertAt.tooltip'))}
+        ${editableField(t('device.battery.field.calibrateTo'), 'calibrateToVolt', '', `/battery/${b.id}`, 'number', ' V',
+          t('device.battery.field.calibrateTo.tooltip'))}
+        ${editableField(t('device.battery.field.voltCalib'), 'voltCalib', b.voltCalib ?? 1, `/battery/${b.id}`, 'number', '',
+          t('device.battery.field.voltCalib.tooltip'))}
         ${field(t('device.battery.field.updated'), fmtDate(b.updatedAt), false,
           t('device.battery.field.updated.tooltip'))}
       </div>

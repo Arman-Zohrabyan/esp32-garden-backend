@@ -319,6 +319,12 @@ function startEdit(span) {
     if (done) return;
     done = true;
     if (!save) { render(); return; }
+    // Nothing changed (or a number field left empty): no request, no
+    // revision bump — just close the editor.
+    const unchanged = type === 'checkbox'
+      ? input.checked === (value === 'true')
+      : input.value === value || (type === 'number' && input.value.trim() === '');
+    if (unchanged) { render(); return; }
 
     const newValue = type === 'checkbox' ? input.checked : type === 'number' ? Number(input.value) : input.value;
     input.disabled = true;

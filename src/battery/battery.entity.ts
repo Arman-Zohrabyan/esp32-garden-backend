@@ -38,6 +38,12 @@ export class Battery {
   @Column({ default: 30 })
   batteryAlertPercent: number;
 
+  // Multimeter / board voltage. Applied when logs are read (see
+  // battery-calibration.ts) — battery_logs keep what the board sent, and the
+  // firmware never sees this value. 1 = no correction.
+  @Column({ type: 'real', default: 1 })
+  voltCalib: number;
+
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;
 

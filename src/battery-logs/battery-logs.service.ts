@@ -1,10 +1,16 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { BatteryLog } from './battery-log.entity';
+import { Battery } from '../battery/battery.entity';
+import { calibrateLog } from '../battery/battery-calibration';
+
+// volt/percentage are corrected by the battery's voltCalib; rawVolt and
+// rawPercentage are what the board sent (and what the table stores).
+export type CalibratedBatteryLog = BatteryLog & { rawVolt: number; rawPercentage: number };
 
 export interface BatteryLogsPage {
-  items: BatteryLog[];
+  items: CalibratedBatteryLog[];
   total: number;
   limit: number;
   offset: number;
@@ -22,6 +28,7 @@ const MAX_LIMIT = 1000;
 export class BatteryLogsService {
   constructor(
     @InjectRepository(BatteryLog) private repo: Repository<BatteryLog>,
+    @InjectRepository(Battery) private batteryRepo: Repository<Battery>,
   ) {}
 
   // Newest-first and paginated. `limit: 0` is an explicit "no pagination"
@@ -46,8 +53,14 @@ export class BatteryLogsService {
       skip,
     });
 
+    const batteryIds = [...new Set(items.map((l) => l.batteryId))];
+    const batteries = batteryIds.length
+      ? await this.batteryRepo.find({ where: { id: In(batteryIds) } })
+      : [];
+    const calibById = new Map(batteries.map((b) => [b.id, b.voltCalib]));
+
     return {
-      items,
+      items: items.map((l) => calibrateLog(l, calibById.get(l.batteryId) ?? 1)),
       total,
       limit: take ?? total,
       offset: skip,

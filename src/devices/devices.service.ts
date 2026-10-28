@@ -10,6 +10,7 @@ import { BatteryLog } from '../battery-logs/battery-log.entity';
 import { PumpSettings } from '../pump-settings/pump-settings.entity';
 import { ensurePumpSettings } from '../pump-settings/pump-settings.service';
 import { WateringLog } from '../watering-logs/watering-log.entity';
+import { calibrateVolt } from '../battery/battery-calibration';
 
 const REVISION_FIELDS: (keyof Device)[] = ['sleepSeconds', 'isActive'];
 
@@ -314,10 +315,20 @@ export class DevicesService {
       where: { deviceId: device.id, wateredAt: MoreThan(new Date(Date.now() - DAY_MS)) },
     });
 
+    // The board sends its raw pump-cell reading; minBatteryVolt is a real
+    // voltage, so compare it against the calibrated one (Battery.voltCalib).
+    const pumpBattery = await this.batteryRepo.findOne({
+      where: { deviceChipId: chipId, type: BatteryType.PUMP },
+    });
+    const pumpVolt =
+      typeof body.pumpBatteryVolt === 'number'
+        ? calibrateVolt(body.pumpBatteryVolt, pumpBattery?.voltCalib ?? 1)
+        : null;
+
     let reason: string | null = null;
     if (!pump.autoWaterEnabled) reason = 'disabled';
     else if (wateringsToday >= pump.maxWateringsPerDay) reason = 'daily_limit';
-    else if (typeof body.pumpBatteryVolt === 'number' && body.pumpBatteryVolt < pump.minBatteryVolt)
+    else if (pumpVolt !== null && pumpVolt < pump.minBatteryVolt)
       reason = 'pump_battery_low';
     else if (soil && typeof body.moisture === 'number' && body.moisture > soil.autoWaterPercent)
       reason = 'not_dry';
