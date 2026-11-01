@@ -10,13 +10,27 @@ import { timingSafeEqual } from 'crypto';
 // Reads are public — the dashboard shows them without any credential. Writes
 // need ADMIN_TOKEN in the X-Admin-Token header.
 //
-// The firmware-facing routes are deliberately exempt (see SKIP_PATHS): the
-// board has no way to hold a dashboard secret, and they are the only POSTs it
-// makes. They stay open exactly as before this guard existed.
+// The firmware-facing routes are deliberately exempt (see SKIP_PATHS and
+// isBoardActivation): the board has no way to hold a dashboard secret. They
+// stay open exactly as before this guard existed.
 const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 // Matched against the path, which always starts with /devices/by-chip/...
 const SKIP_PATHS = [/^\/devices\/by-chip\/[^/]+\/(sync|report|watering)$/];
+
+const DEVICE_PATH = /^\/devices\/[0-9a-f-]{36}$/i;
+
+// The board's own "activate" button on garden.local sends PUT /devices/:id
+// with exactly {"isActive":true} (firmware apiPutIsActive). Only that exact
+// body passes without the token: renaming, changing sleepSeconds or
+// deactivating from outside still needs it.
+function isBoardActivation(req: Request, path: string): boolean {
+  if (req.method !== 'PUT' || !DEVICE_PATH.test(path)) return false;
+  const body: unknown = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const keys = Object.keys(body);
+  return keys.length === 1 && keys[0] === 'isActive' && (body as { isActive: unknown }).isActive === true;
+}
 
 @Injectable()
 export class AdminTokenGuard implements CanActivate {
@@ -26,6 +40,7 @@ export class AdminTokenGuard implements CanActivate {
 
     const path = req.path ?? req.url.split('?')[0];
     if (SKIP_PATHS.some((re) => re.test(path))) return true;
+    if (isBoardActivation(req, path)) return true;
 
     const expected = process.env.ADMIN_TOKEN;
     // No token configured means the deployment hasn't opted into write
